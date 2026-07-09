@@ -22,11 +22,13 @@ RDK X5 + USB depth camera autonomous pavement inspection robot with full percept
 
 ## Core Self-developed ROS Code Structure
 road_inspect_ws/src
-├── depth_cam_driver # 感知层：深度相机图像采集
-├── road_detect_node # 决策层：YOLO 推理 + 多帧校验 + 状态机逻辑
-├── car_control # 执行层：底盘直行、定点停车控制
-├── data_upload_http # 通信层：WiFi 上传病害数据至 Django 接口
-└── inspect_launch # 一键启动整套巡检系统 launch 文件
+└── road_detect_node    
+    # 集成全链路逻辑：
+    # 1.感知：USB深度相机图像采集
+    # 2.决策：YOLO病害推理、多帧校验防误判、状态机调度
+    # 3.执行：小车底盘直行、病害定点停车3s控制
+    # 4.通信：WiFi HTTP接口上传图像与检测结果
+    # 5.启动：内置多节点一键启动逻辑
 
 
 ## Quick Start (Robot Side)
