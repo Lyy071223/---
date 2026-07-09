@@ -1,0 +1,221 @@
+import rclpy
+from std_msgs.msg import Bool
+from rclpy.node import Node
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
+import cv2
+from ultralytics import YOLO
+import sys
+
+# 已适配你的模型路径，不用改
+MODEL_PATH = "/home/sunrise/code/road_detection-main/newModel.pt"
+CONF_THRESHOLD = 0.1
+import json
+from minio import Minio
+import pymysql
+# ========== Web平台同步配置（和你现有环境完全对齐） ==========
+# MinIO 配置：API端口用9000，生成的图片地址前端可直接访问
+MINIO_ENDPOINT = "192.168.137.45:9000"
+MINIO_ACCESS_KEY = "admin"
+MINIO_SECRET_KEY = "Lyy430520"
+MINIO_BUCKET = "storage"
+
+# MySQL 配置：如果你的MySQL密码不是默认值，也改成实际的root密码
+MYSQL_HOST = "127.0.0.1"
+MYSQL_PORT = 3306
+MYSQL_USER = "django"
+MYSQL_PASSWORD = "road123456"  # 这里也要换成你MySQL的真实root密码
+MYSQL_DB = "road_detection"
+
+
+
+class RoadDefectDetector(Node):
+    def __init__(self):
+        # 第一步：必须先初始化父类Node，否则无法使用logger、发布订阅等功能
+        super().__init__('road_defect_detector')
+        
+        self.bridge = CvBridge()
+        self.running = True
+        self.frame_count = 0
+        self.last_results = None
+
+        # 1. 加载YOLO模型
+        self.model = YOLO(MODEL_PATH)
+        self.get_logger().info("✅ YOLO模型加载成功（已开启速度优化）")
+
+        # 2. 订阅930相机RGB话题
+        self.subscription = self.create_subscription(
+            Image,
+            '/aurora/rgb/image_raw',
+            self.image_callback,
+            10
+        )
+        self.get_logger().info("📷 已订阅相机RGB话题，后台检测运行中...")
+
+        # 3. 发布检测结果画面话题（供rqt查看）
+        self.result_pub = self.create_publisher(
+            Image,
+            '/defect_detection/image_result',
+            10
+        )
+
+        # ========== 新增：病害停车控制 ==========
+        self.control_pub = self.create_publisher(Bool, '/defect_control', 10)
+        self.defect_continuous_count = 0  # 连续检测到病害的帧数（防抖用）
+        self.is_parking = False           # 当前是否处于停车状态
+        self.parking_start_time = 0       # 停车开始时间戳
+        self.parking_duration = 2.0       # 单次停车停留时长（秒）
+        self.cooldown_time = 3.0          # 停车恢复后的冷却时间，避免重复触发
+        self.last_parking_end_time = 0    # 上次停车结束的时间戳
+
+        # ========== Web平台同步初始化 ==========
+        try:
+            self.minio_client = Minio(
+                MINIO_ENDPOINT,
+                access_key=MINIO_ACCESS_KEY,
+                secret_key=MINIO_SECRET_KEY,
+                secure=False
+            )
+            self.mysql_conn = pymysql.connect(
+                host=MYSQL_HOST,
+                port=MYSQL_PORT,
+                user=MYSQL_USER,
+                password=MYSQL_PASSWORD,
+                database=MYSQL_DB,
+                charset='utf8mb4'
+            )
+            self.get_logger().info("✅ 已连接Web平台数据库，检测结果将同步到历史记录")
+        except Exception as e:
+            self.get_logger().warn(f"⚠️ Web平台连接失败，检测结果不同步: {e}")
+            self.mysql_conn = None
+
+    def image_callback(self, msg):
+        if not self.running:
+            return
+
+        # ROS图像转OpenCV格式
+        try:
+            cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        except Exception as e:
+            self.get_logger().error(f"图像格式转换失败: {e}")
+            return
+
+        # 基础日志：每秒打印一次，确认图像正常进来
+        self.get_logger().info(
+            f"收到图像，尺寸: {cv_image.shape[1]}x{cv_image.shape[0]}",
+            throttle_duration_sec=1
+        )
+
+        # YOLO病害检测
+        try:
+            results = self.model.predict(
+                source=cv_image,
+                conf=CONF_THRESHOLD,
+                verbose=False,
+                imgsz=320
+            )
+        except Exception as e:
+            self.get_logger().error(f"模型推理失败: {e}")
+            return
+
+        # 绘制检测框
+        annotated_frame = results[0].plot()
+
+        # 病害检测 + 停车控制状态机
+        defect_count = len(results[0].boxes)
+        current_time = self.get_clock().now().nanoseconds / 1e9
+
+        if self.is_parking:
+            # 停车中，计时到点就恢复行驶
+            if current_time - self.parking_start_time >= self.parking_duration:
+                self.is_parking = False
+                self.last_parking_end_time = current_time
+                self.control_pub.publish(Bool(data=False))
+                self.get_logger().info("✅ 病害记录完成，小车继续巡检")
+        else:
+            # 非停车状态，先判断冷却时间
+            in_cooldown = current_time - self.last_parking_end_time < self.cooldown_time
+            if not in_cooldown:
+                if defect_count > 0:
+                    self.defect_continuous_count += 1
+                    # 连续3帧检测到病害才触发停车，防抖
+                    if self.defect_continuous_count >= 3:
+                        self.is_parking = True
+                        self.parking_start_time = current_time
+                        self.control_pub.publish(Bool(data=True))
+                        self.get_logger().info("🚨 检测到连续病害，小车自动停车记录")
+                        # 保存病害记录图片
+                        save_name = f"/tmp/defect_{self.get_clock().now().nanoseconds}.jpg"
+                        cv2.imwrite(save_name, annotated_frame)
+                        self.get_logger().info(f"💾 病害图片已保存：{save_name}")
+                        # 同步到Web平台历史数据
+                        if self.mysql_conn:
+                            try:
+                                # 1. 上传标注图到MinIO
+                                object_name = f"ros_defect_{self.get_clock().now().nanoseconds}.jpg"
+                                self.minio_client.fput_object(
+                                    MINIO_BUCKET,
+                                    object_name,
+                                    save_name,
+                                    content_type="image/jpeg"
+                                )
+                                img_url = f"http://{MINIO_ENDPOINT}/{MINIO_BUCKET}/{object_name}"
+
+                                # 2. 整理检测结果JSON（和你原Web端格式完全一致）
+                                result_list = []
+                                for box in results[0].boxes:
+                                    result_list.append({
+                                        "class": results[0].names[int(box.cls[0])],
+                                        "confidence": round(float(box.conf[0]), 4),
+                                        "bbox": box.xyxy[0].tolist()
+                                    })
+                                result_json = json.dumps(result_list, ensure_ascii=False)
+
+                                # 3. 写入MySQL，前端历史数据直接读取
+                                cursor = self.mysql_conn.cursor()
+                                sql = "INSERT INTO detection_result (img_url, result) VALUES (%s, %s)"
+                                cursor.execute(sql, (img_url, result_json))
+                                self.mysql_conn.commit()
+                                cursor.close()
+
+                                self.get_logger().info("☁️ 已同步到Web平台历史记录")
+                            except Exception as e:
+                                self.get_logger().error(f"同步失败: {e}")
+                                if self.mysql_conn:
+                                    self.mysql_conn.rollback()
+
+                else:
+                    # 没检测到病害，重置计数器
+                    self.defect_continuous_count = 0
+
+        # 发布结果画面
+        try:
+            result_msg = self.bridge.cv2_to_imgmsg(annotated_frame, encoding="bgr8")
+            result_msg.header = msg.header
+            self.result_pub.publish(result_msg)
+        except Exception as e:
+            self.get_logger().error(f"结果画面发布失败: {e}")
+    def stop(self):
+        self.running = False
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    detector = RoadDefectDetector()
+    
+    try:
+        rclpy.spin(detector)
+    except KeyboardInterrupt:
+        detector.get_logger().info("正在退出...")
+    except Exception as e:
+        print(f"程序异常: {e}")
+    finally:
+        detector.stop()
+        detector.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+        sys.exit(0)
+
+
+if __name__ == '__main__':
+    main()
